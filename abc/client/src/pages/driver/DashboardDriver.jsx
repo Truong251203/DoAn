@@ -20,6 +20,8 @@ import CalendarTodayIcon from '@mui/icons-material/CalendarToday';
 import CloseIcon from '@mui/icons-material/Close';
 import CancelIcon from '@mui/icons-material/Cancel';
 import AccessAlarmIcon from '@mui/icons-material/AccessAlarm';
+import EditIcon from '@mui/icons-material/Edit';
+import MapIcon from '@mui/icons-material/Map';
 
 // --- 1. ICON XE MÁY (SVG) ---
 const driverSvgXml = `
@@ -112,15 +114,52 @@ function MapUpdater({ center, route }) {
 function DashboardDriver() {
   const [orders, setOrders] = useState([]);
   
+  // State Sắp xếp
+  const [sortedOrders, setSortedOrders] = useState([]);
+  const [isSortingOrders, setIsSortingOrders] = useState(false);
+
   // Stats & Modals
   const [stats, setStats] = useState({ totalOrders: 0, totalKm: 0, totalFuel: 0, totalProfit: 0 });
   const [dailyStats, setDailyStats] = useState([]);
   const [showRevenueModal, setShowRevenueModal] = useState(false);
   
+  // Profile & Edit Profile State
+  const [profile, setProfile] = useState({});
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [operatingArea, setOperatingArea] = useState("");
+  const [phone, setPhone] = useState("");
+
   // Fail Modal State
   const [showFailPopup, setShowFailPopup] = useState(false);
   const [failReason, setFailReason] = useState("");
   const [failOrderId, setFailOrderId] = useState(null);
+
+  const fetchProfile = async () => { 
+      try { 
+          const res = await api.get("/users/me"); 
+          setProfile(res.data); 
+          setOperatingArea(res.data.operatingArea || "");
+          setPhone(res.data.phone || ""); // Lấy sđt từ server nếu có
+      } catch (e) {} 
+  };
+
+  const handleUpdateProfile = async () => {
+      if (!operatingArea) return alert("Vui lòng chọn Khu vực hoạt động!");
+      
+      try {
+          await api.put("/users/me", { operatingArea, phone });
+          
+          setProfile(prev => ({ ...prev, operatingArea, phone }));
+          setShowProfileModal(false);
+          
+          // Note: Backend đã tự bắn socket "driverProfileUpdated" từ hàm API PUT /me
+          // nên ở Frontend ta không cần dùng socket.emit ở đây nữa để tránh bắn đúp sự kiện.
+
+          alert("Cập nhật thông tin thành công!");
+      } catch (e) {
+          alert("Lỗi cập nhật thông tin");
+      }
+  };
 
   // Map & Simulation
   const [currentLocation, setCurrentLocation] = useState([21.0285, 105.8542]); 
@@ -129,18 +168,134 @@ function DashboardDriver() {
   
   const [isSimulating, setIsSimulating] = useState(false);
   const simulationIndexRef = useRef(0); 
-  const [profile, setProfile] = useState({});
 
   useEffect(() => {
     fetchProfile();
     fetchOrders();
     fetchStats();
     fetchDailyStats();
-    // Giả lập lấy vị trí GPS hiện tại
     navigator.geolocation?.getCurrentPosition(
         (pos) => setCurrentLocation([pos.coords.latitude, pos.coords.longitude])
     );
   }, []);
+
+  // --- THUẬT TOÁN TỐI ƯU HÓA TOÀN CỤC (GLOBAL OPTIMIZATION - VROOM API) ---
+  useEffect(() => {
+      const sortOrdersGlobally = async () => {
+          setIsSortingOrders(true);
+          const delivering = orders.filter(o => o.status === 'delivering');
+          const completed = orders.filter(o => o.status === 'completed' || o.status === 'failed');
+          const assigned = [...orders.filter(o => o.status === 'assigned')];
+
+          const now = new Date().getTime();
+          const fiveHoursInMs = 5 * 60 * 60 * 1000;
+
+          const urgentOrders = assigned.filter(o => o.pickupTime && (new Date(o.pickupTime).getTime() - now) <= fiveHoursInMs);
+          let normalOrders = assigned.filter(o => !(o.pickupTime && (new Date(o.pickupTime).getTime() - now) <= fiveHoursInMs));
+
+          urgentOrders.sort((a, b) => new Date(a.pickupTime).getTime() - new Date(b.pickupTime).getTime());
+          
+          let sequenced = [...urgentOrders];
+          
+          let optimizationStartLoc = currentLocation; 
+          if (delivering.length > 0) {
+              const currentDeliveringDropoff = getPoint(delivering[delivering.length - 1], 'dropoff');
+              if (currentDeliveringDropoff && typeof currentDeliveringDropoff.lat === 'number') {
+                  optimizationStartLoc = [currentDeliveringDropoff.lat, currentDeliveringDropoff.lng];
+              }
+          }
+          
+          if (urgentOrders.length > 0) {
+              const lastUrgentDropoff = getPoint(urgentOrders[urgentOrders.length - 1], 'dropoff');
+              if (lastUrgentDropoff && typeof lastUrgentDropoff.lat === 'number') {
+                  optimizationStartLoc = [lastUrgentDropoff.lat, lastUrgentDropoff.lng];
+              }
+          }
+
+          const validNormalOrders = normalOrders.filter(o => {
+              const p = getPoint(o, 'pickup');
+              const d = getPoint(o, 'dropoff');
+              return p && d && typeof p.lat === 'number' && typeof d.lat === 'number';
+          });
+          const invalidOrders = normalOrders.filter(o => !validNormalOrders.includes(o)); 
+
+          const orsKey = import.meta.env.VITE_ORS_API_KEY;
+
+          if (validNormalOrders.length > 0) {
+              try {
+                  if (!orsKey) throw new Error("Missing ORS API Key");
+
+                  const vehicles = [{
+                      id: 1,
+                      profile: "driving-car",
+                      start: [optimizationStartLoc[1], optimizationStartLoc[0]],
+                      capacity: [1]
+                  }];
+
+                  const shipments = validNormalOrders.map((order, idx) => {
+                      const pickup = getPoint(order, 'pickup');
+                      const dropoff = getPoint(order, 'dropoff');
+                      
+                      return {
+                          amount: [1],
+                          pickup: { id: idx * 2 + 1, location: [pickup.lng, pickup.lat] },
+                          delivery: { id: idx * 2 + 2, location: [dropoff.lng, dropoff.lat] }
+                      };
+                  });
+
+                  const res = await axios.post(
+                      'https://api.openrouteservice.org/optimization',
+                      { vehicles, shipments },
+                      { headers: { 'Authorization': orsKey, 'Content-Type': 'application/json' } }
+                  );
+
+                  const steps = res.data?.routes?.[0]?.steps || [];
+                  const optimizedNormalOrders = [];
+
+                  steps.forEach(step => {
+                      if (step.type === 'pickup') {
+                          const shipmentIndex = Math.floor((step.id - 1) / 2);
+                          optimizedNormalOrders.push(validNormalOrders[shipmentIndex]);
+                      }
+                  });
+
+                  sequenced = [...sequenced, ...optimizedNormalOrders];
+
+              } catch (error) {
+                  let currLoc = optimizationStartLoc;
+                  let remaining = [...validNormalOrders];
+                  
+                  while(remaining.length > 0) {
+                       let nextIdx = 0;
+                       let minDistance = Infinity;
+                       remaining.forEach((o, idx) => {
+                           const pickup = getPoint(o, 'pickup');
+                           const dist = getDistance(currLoc[0], currLoc[1], pickup.lat, pickup.lng);
+                           if (dist < minDistance) {
+                               minDistance = dist;
+                               nextIdx = idx;
+                           }
+                       });
+                       const chosen = remaining.splice(nextIdx, 1)[0];
+                       sequenced.push(chosen);
+                       const dropoff = getPoint(chosen, 'dropoff');
+                       currLoc = [dropoff.lat, dropoff.lng];
+                  }
+              }
+          }
+
+          setSortedOrders([...delivering, ...sequenced, ...invalidOrders, ...completed]);
+          setIsSortingOrders(false);
+      };
+
+      if (orders.length > 0) sortOrdersGlobally();
+      else { setSortedOrders([]); setIsSortingOrders(false); }
+      
+  }, [orders]); 
+
+  const isCurrentlyDelivering = useMemo(() => {
+      return orders.some(o => o.status === 'delivering');
+  }, [orders]);
 
   // --- LOGIC MÔ PHỎNG ---
   useEffect(() => {
@@ -161,45 +316,7 @@ function DashboardDriver() {
     }
     return () => clearInterval(interval);
   }, [isSimulating, routeCoords, activeOrder]);
-  // =====================================================================
-  // --- LOGIC TRACKING GPS THỰC TẾ (DÙNG CHO PRODUCTION) ---
-  // =====================================================================
-  /*
-  useEffect(() => {
-    let watchId;
 
-    // Chỉ bắt đầu theo dõi vị trí liên tục khi tài xế bấm "Bắt đầu giao"
-    if (activeOrder?.status === 'delivering') {
-        watchId = navigator.geolocation.watchPosition(
-            (position) => {
-                const realLoc = [position.coords.latitude, position.coords.longitude];
-                
-                // 1. Cập nhật vị trí xe trên bản đồ của chính tài xế
-                setCurrentLocation(realLoc);
-                
-                // 2. Bắn tọa độ THẬT lên Server để Khách hàng và Điều phối viên cùng thấy
-                socket.emit("driverLocationUpdate", { 
-                    orderId: activeOrder._id, 
-                    location: realLoc 
-                });
-            },
-            (error) => {
-                console.error("Lỗi lấy GPS thực tế: ", error);
-            },
-            { 
-                enableHighAccuracy: true, // Bật GPS độ chính xác cao nhất
-                maximumAge: 0,            // Không dùng dữ liệu cũ lưu cache
-                timeout: 10000            // Cập nhật lại nếu quá 10s
-            }
-        );
-    }
-
-    // Khi hoàn thành đơn hoặc tắt app, tự động hủy theo dõi GPS để đỡ tốn pin
-    return () => {
-        if (watchId) navigator.geolocation.clearWatch(watchId);
-    };
-  }, [activeOrder]);
-  */
   // --- SOCKET ---
   useEffect(() => {
     socket.on("orderUpdated", (updatedOrder) => {
@@ -215,7 +332,6 @@ function DashboardDriver() {
   }, [activeOrder]);
 
   // --- API ---
-  const fetchProfile = async () => { try { const res = await api.get("/users/me"); setProfile(res.data); } catch (e) {} };
   const fetchOrders = async () => {
     try {
       const res = await api.get("/orders");
@@ -223,7 +339,9 @@ function DashboardDriver() {
       setOrders(myOrders);
     } catch (e) {}
   };
+  
   const fetchStats = async () => { try { const res = await api.get("/drivers/stats"); if(res.data) setStats(res.data); } catch(e){} };
+  
   const fetchDailyStats = async () => {
       try {
           const res = await api.get("/orders");
@@ -240,79 +358,19 @@ function DashboardDriver() {
       } catch (e) {}
   };
 
-  // --- THUẬT TOÁN SẮP XẾP ĐƠN HÀNG THÔNG MINH ---
-  const sortedOrders = useMemo(() => {
-      const delivering = orders.filter(o => o.status === 'delivering');
-      const completed = orders.filter(o => o.status === 'completed' || o.status === 'failed');
-      let assigned = orders.filter(o => o.status === 'assigned');
-
-      const now = new Date().getTime();
-      const fiveHoursInMs = 5 * 60 * 60 * 1000;
-      let sequenced = [];
-      let currLoc = currentLocation;
-
-      while (assigned.length > 0) {
-          let nextIdx = -1;
-          
-          const urgentOrders = assigned.filter(o => o.pickupTime && (new Date(o.pickupTime).getTime() - now) <= fiveHoursInMs);
-
-          if (urgentOrders.length > 0) {
-              let earliestTime = Infinity;
-              assigned.forEach((o, idx) => {
-                  if (o.pickupTime) {
-                      const t = new Date(o.pickupTime).getTime();
-                      if (t < earliestTime) {
-                          earliestTime = t;
-                          nextIdx = idx;
-                      }
-                  }
-              });
-          } else {
-              let minDistance = Infinity;
-              assigned.forEach((o, idx) => {
-                  const pickup = getPoint(o, 'pickup');
-                  if (pickup && typeof pickup.lat === 'number') {
-                      const dist = getDistance(currLoc[0], currLoc[1], pickup.lat, pickup.lng);
-                      if (dist < minDistance) {
-                          minDistance = dist;
-                          nextIdx = idx;
-                      }
-                  }
-              });
-              if (nextIdx === -1) nextIdx = 0; 
-          }
-
-          const chosenOrder = assigned.splice(nextIdx, 1)[0];
-          sequenced.push(chosenOrder);
-
-          const dropoff = getPoint(chosenOrder, 'dropoff');
-          if (dropoff && typeof dropoff.lat === 'number') {
-              currLoc = [dropoff.lat, dropoff.lng];
-          }
-      }
-
-      return [...delivering, ...sequenced, ...completed];
-  }, [orders, currentLocation]);
-
-  const isCurrentlyDelivering = useMemo(() => {
-      return orders.some(o => o.status === 'delivering');
-  }, [orders]);
-
-  // --- HÀM VẼ ĐƯỜNG 3 ĐIỂM (TÀI XẾ -> LẤY HÀNG -> GIAO HÀNG) ---
+  // --- HÀM VẼ ĐƯỜNG ---
   const drawRoute = async (order, currentLoc) => {
       const pickup = getPoint(order, 'pickup');
       const dropoff = getPoint(order, 'dropoff');
 
-      // Nếu đơn bị lỗi dữ liệu, thoát
       if (!pickup || !dropoff || typeof pickup.lat !== 'number' || typeof dropoff.lat !== 'number') {
           setRouteCoords([]); 
           return;
       }
 
-      const p1 = [pickup.lat, pickup.lng]; // Điểm lấy
-      const p2 = [dropoff.lat, dropoff.lng]; // Điểm giao
+      const p1 = [pickup.lat, pickup.lng]; 
+      const p2 = [dropoff.lat, dropoff.lng]; 
       
-      // Fallback: Mặc định vẽ đường thẳng nối 3 điểm (Tài xế -> Lấy -> Giao)
       let finalRouteCoords = [currentLoc, p1, p2].filter(Boolean);
       
       const orsKey = import.meta.env.VITE_ORS_API_KEY;
@@ -321,19 +379,16 @@ function DashboardDriver() {
               let driverToPickupCoords = [];
               let pickupToDropoffCoords = [];
 
-              // Chặng 1: Tài xế -> Điểm Lấy Hàng (Chỉ gọi nếu có vị trí hiện tại)
               if (currentLoc && currentLoc[0] && currentLoc[1]) {
                   const url1 = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${orsKey}&start=${currentLoc[1]},${currentLoc[0]}&end=${p1[1]},${p1[0]}`;
                   const r1 = await axios.get(url1);
                   driverToPickupCoords = r1.data?.features?.[0]?.geometry?.coordinates?.map(c => [c[1], c[0]]) || [];
               }
 
-              // Chặng 2: Điểm Lấy Hàng -> Điểm Giao Hàng
               const url2 = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${orsKey}&start=${p1[1]},${p1[0]}&end=${p2[1]},${p2[0]}`;
               const r2 = await axios.get(url2);
               pickupToDropoffCoords = r2.data?.features?.[0]?.geometry?.coordinates?.map(c => [c[1], c[0]]) || [];
 
-              // Gộp 2 chặng lại thành 1 lộ trình duy nhất
               if (driverToPickupCoords.length > 0 || pickupToDropoffCoords.length > 0) {
                   finalRouteCoords = [...driverToPickupCoords, ...pickupToDropoffCoords];
               }
@@ -347,7 +402,6 @@ function DashboardDriver() {
 
   const selectOrder = (order) => {
       setActiveOrder(order);
-      // Khi chọn đơn, vẽ lộ trình từ vị trí hiện tại của tài xế
       drawRoute(order, currentLocation);
   };
 
@@ -362,7 +416,6 @@ function DashboardDriver() {
 
           alert("Bắt đầu giao hàng! 🚚");
           
-          // Vẽ lại đường đi cập nhật nhất khi bấm bắt đầu giao
           drawRoute(order, currentLocation);
           setIsSimulating(true);
           simulationIndexRef.current = 0;
@@ -401,7 +454,6 @@ function DashboardDriver() {
       } catch (e) { alert("Lỗi gửi báo cáo"); }
   };
 
-  // Các biến an toàn để render Map Marker
   const activePickup = getPoint(activeOrder, 'pickup');
   const activeDropoff = getPoint(activeOrder, 'dropoff');
 
@@ -413,7 +465,20 @@ function DashboardDriver() {
       <div className="bg-gradient-to-r from-green-600 to-teal-700 text-white p-6 pb-24 rounded-b-[2.5rem] shadow-xl">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <h1 className="text-2xl font-bold flex items-center gap-2"><LocalShippingIcon fontSize="large"/> Driver</h1>
-          <div className="flex items-center gap-4"><span className="font-bold">{profile.name}</span><LogoutButton className="bg-white/20 hover:bg-white/30 px-3 py-1 rounded-full text-sm transition"/></div>
+          <div className="flex items-center gap-4">
+              <div className="flex flex-col text-right">
+                  <span className="font-bold text-lg">{profile.name}</span>
+                  {profile.operatingArea && <span className="text-xs text-green-100 flex justify-end items-center"><MapIcon fontSize="inherit" className="mr-1"/> {profile.operatingArea}</span>}
+              </div>
+              <button 
+                  onClick={() => setShowProfileModal(true)} 
+                  className="bg-white/20 hover:bg-white/30 p-2 rounded-full transition" 
+                  title="Sửa hồ sơ"
+              >
+                  <EditIcon fontSize="small"/>
+              </button>
+              <LogoutButton className="bg-white/20 hover:bg-white/30 px-3 py-2 rounded-full text-sm font-bold transition"/>
+          </div>
         </div>
       </div>
 
@@ -422,26 +487,44 @@ function DashboardDriver() {
         {/* STATS */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 animate-fade-in">
             <StatCard icon={<LocalShippingIcon/>} title="Tổng đơn" value={stats.totalOrders || 0} color="bg-blue-500" />
-            
             <StatCard icon={<SpeedIcon/>} title="Tổng Km" value={`${(stats.totalKm || 0).toFixed(1)} km`} color="bg-indigo-500" />
-            
             <div onClick={() => setShowRevenueModal(true)} className="cursor-pointer transform transition hover:scale-105">
                 <StatCard icon={<LocalGasStationIcon/>} title="Nhiên liệu (L)" value={`${(stats.fuelUsed || 0).toFixed(1)} L`} color="bg-orange-500" />
             </div>
-            
             <div onClick={() => setShowRevenueModal(true)} className="cursor-pointer transform transition hover:scale-105">
                 <StatCard icon={<AttachMoneyIcon/>} title="Doanh thu" value={`${(stats.revenue || 0).toLocaleString()} đ`} color="bg-green-600" />
             </div>
         </div>
 
+        {/* Layout thay đổi dựa trên activeOrder */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
             {/* List Orders */}
-            <div className="lg:col-span-1 bg-white rounded-2xl shadow-sm border border-gray-100 p-4 h-[650px] overflow-hidden flex flex-col">
-                <h2 className="font-bold text-lg mb-1 text-gray-800 flex items-center gap-2"><PersonIcon className="text-green-600"/> Lịch trình đề xuất</h2>
-                <p className="text-xs text-gray-500 mb-4 italic">Đã sắp xếp tối ưu theo Hạn giao & Quãng đường</p>
-                <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-3">
-                    {sortedOrders.length === 0 && <p className="text-center text-gray-400 py-10">Chưa có đơn hàng.</p>}
-                    {sortedOrders.map((order, idx) => {
+            <div className={`transition-all duration-300 bg-white rounded-2xl shadow-sm border border-gray-100 p-4 min-h-[650px] max-h-[800px] flex flex-col ${activeOrder ? 'lg:col-span-1' : 'lg:col-span-3'}`}>
+                <div className="flex justify-between items-end mb-4">
+                    <div>
+                        <h2 className="font-bold text-lg mb-1 text-gray-800 flex items-center gap-2"><PersonIcon className="text-green-600"/> Lịch trình đề xuất</h2>
+                        <p className="text-xs text-gray-500 italic">Đã tối ưu Toàn cục theo Hạn giao & Tổng lộ trình</p>
+                    </div>
+                    {activeOrder && (
+                        <button onClick={() => setActiveOrder(null)} className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg font-bold transition">
+                            Đóng bản đồ
+                        </button>
+                    )}
+                </div>
+                
+                {/* Loader State */}
+                {isSortingOrders && (
+                    <div className="flex justify-center items-center py-4">
+                        <span className="animate-pulse text-sm text-blue-600 font-bold flex items-center gap-1">🔄 Đang tối ưu lộ trình...</span>
+                    </div>
+                )}
+
+                {/* Chuyển thành dạng lưới (Grid) */}
+                <div className={`flex-1 overflow-y-auto pr-2 custom-scrollbar grid gap-4 content-start ${activeOrder ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'}`}>
+                    {sortedOrders.length === 0 && !isSortingOrders && <p className="col-span-full text-center text-gray-400 py-10">Chưa có đơn hàng.</p>}
+                    
+                    {!isSortingOrders && sortedOrders.map((order, idx) => {
                         const now = new Date().getTime();
                         let isOverdue = false;
                         let isUrgent = false;
@@ -453,36 +536,38 @@ function DashboardDriver() {
                         }
 
                         return (
-                        <div key={order._id} onClick={() => selectOrder(order)} className={`p-4 rounded-xl border cursor-pointer transition relative ${activeOrder?._id === order._id ? "bg-green-50 border-green-500 shadow-md" : "bg-white border-gray-200 hover:shadow-sm"}`}>
+                        <div key={order._id} onClick={() => selectOrder(order)} className={`p-4 rounded-xl border cursor-pointer transition relative flex flex-col justify-between h-full ${activeOrder?._id === order._id ? "bg-green-50 border-green-500 shadow-md" : "bg-white border-gray-200 hover:shadow-sm hover:border-blue-300"}`}>
                             
-                            <div className="flex justify-between items-start mb-2">
-                                <div className="flex flex-col gap-1 items-start">
-                                    {idx === 0 && order.status === 'assigned' && (
-                                        <span className="bg-blue-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-sm animate-bounce w-max">
-                                            📍 ĐIỂM TIẾP THEO
+                            <div>
+                                <div className="flex justify-between items-start mb-2">
+                                    <div className="flex flex-col gap-1 items-start">
+                                        {idx === 0 && order.status === 'assigned' && (
+                                            <span className="bg-blue-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-sm animate-bounce w-max">
+                                                📍 ĐIỂM TIẾP THEO
+                                            </span>
+                                        )}
+                                        <span className="bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded-md font-bold w-max">
+                                            #{order._id.slice(-6).toUpperCase()}
                                         </span>
-                                    )}
-                                    <span className="bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded-md font-bold w-max">
-                                        #{order._id.slice(-6).toUpperCase()}
-                                    </span>
+                                    </div>
+                                    <StatusBadge status={order.status} />
                                 </div>
-                                <StatusBadge status={order.status} />
-                            </div>
-                            
-                            {order.pickupTime && order.status !== 'completed' && order.status !== 'failed' && (
-                                <div className={`mb-3 flex items-center gap-1 text-xs font-bold px-2 py-1.5 rounded-lg border w-fit ${isOverdue ? 'bg-red-50 text-red-600 border-red-200' : isUrgent ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-gray-50 text-gray-600 border-gray-200'}`}>
-                                    <AccessAlarmIcon fontSize="inherit"/>
-                                    {isOverdue ? '🔴 QUÁ HẠN:' : isUrgent ? '⚠️ GẤP:' : 'Hạn giao:'} {new Date(order.pickupTime).toLocaleString("vi-VN", { hour: '2-digit', minute:'2-digit', day: '2-digit', month: '2-digit'})}
-                                </div>
-                            )}
+                                
+                                {order.pickupTime && order.status !== 'completed' && order.status !== 'failed' && (
+                                    <div className={`mb-3 flex items-center gap-1 text-xs font-bold px-2 py-1.5 rounded-lg border w-fit ${isOverdue ? 'bg-red-50 text-red-600 border-red-200' : isUrgent ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-gray-50 text-gray-600 border-gray-200'}`}>
+                                        <AccessAlarmIcon fontSize="inherit"/>
+                                        {isOverdue ? '🔴 QUÁ HẠN:' : isUrgent ? '⚠️ GẤP:' : 'Hạn giao:'} {new Date(order.pickupTime).toLocaleString("vi-VN", { hour: '2-digit', minute:'2-digit', day: '2-digit', month: '2-digit'})}
+                                    </div>
+                                )}
 
-                            <div className="text-sm space-y-1 text-gray-600">
-                                <p className="line-clamp-1"><strong className="text-blue-600">Lấy:</strong> {order.pickupAddress}</p>
-                                <p className="line-clamp-1"><strong className="text-red-600">Giao:</strong> {order.deliveryAddress}</p>
-                                <p className="pt-2 border-t border-dashed mt-2 font-bold text-gray-800 text-right">{(order.price || order.cost || 0).toLocaleString()} đ</p>
+                                <div className="text-sm space-y-1 text-gray-600">
+                                    <p className="line-clamp-2" title={order.pickupAddress}><strong className="text-blue-600">Lấy:</strong> {order.pickupAddress}</p>
+                                    <p className="line-clamp-2" title={order.deliveryAddress}><strong className="text-red-600">Giao:</strong> {order.deliveryAddress}</p>
+                                    <p className="pt-2 border-t border-dashed mt-2 font-bold text-gray-800 text-right">{(order.price || order.cost || 0).toLocaleString()} đ</p>
+                                </div>
                             </div>
                             
-                            <div className="mt-4 flex gap-2">
+                            <div className="mt-4 flex gap-2 w-full">
                                 {order.status === "assigned" && (
                                     <button 
                                         onClick={(e) => { e.stopPropagation(); handleStartDelivery(order); }} 
@@ -490,7 +575,7 @@ function DashboardDriver() {
                                         className={`w-full py-2 rounded-lg font-bold shadow flex items-center justify-center gap-1 transition ${isCurrentlyDelivering ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
                                         title={isCurrentlyDelivering ? "Bạn phải hoàn thành đơn đang giao trước!" : ""}
                                     >
-                                        <PlayCircleFilledWhiteIcon fontSize="small"/> {isCurrentlyDelivering ? 'Đang bận giao đơn khác' : 'Bắt đầu'}
+                                        <PlayCircleFilledWhiteIcon fontSize="small"/> {isCurrentlyDelivering ? 'Đang giao đơn khác' : 'Bắt đầu'}
                                     </button>
                                 )}
                                 {order.status === "delivering" && (
@@ -505,9 +590,9 @@ function DashboardDriver() {
                 </div>
             </div>
 
-            {/* Map */}
-            <div className="lg:col-span-2 bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden h-[650px] relative z-0">
-                {activeOrder ? (
+            {/* Map (Chỉ hiển thị khi có activeOrder) */}
+            {activeOrder && (
+                <div className="lg:col-span-2 bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden h-[650px] relative z-0 transition-all duration-300 animate-fade-in">
                     <MapContainer center={currentLocation} zoom={14} style={{ height: "100%", width: "100%" }}>
                         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
                         <MapUpdater center={currentLocation} route={routeCoords} />
@@ -517,11 +602,9 @@ function DashboardDriver() {
                         {activePickup?.lat && <Marker position={[activePickup.lat, activePickup.lng]} icon={pickupIcon}><Popup>Lấy hàng</Popup></Marker>}
                         {activeDropoff?.lat && <Marker position={[activeDropoff.lat, activeDropoff.lng]} icon={deliveryIcon}><Popup>Giao hàng</Popup></Marker>}
                     </MapContainer>
-                ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-400 bg-gray-50"><NavigationIcon style={{ fontSize: 80 }} className="mb-4 opacity-20 text-green-500"/><p className="text-lg font-medium">Chọn đơn hàng để xem chi tiết</p></div>
-                )}
-                {isSimulating && <div className="absolute top-4 left-4 z-[999] bg-white/90 px-4 py-2 rounded-lg shadow border-l-4 border-green-500 font-bold text-green-700 animate-pulse">🚚 Đang chia sẻ vị trí...</div>}
-            </div>
+                    {isSimulating && <div className="absolute top-4 left-4 z-[999] bg-white/90 px-4 py-2 rounded-lg shadow border-l-4 border-green-500 font-bold text-green-700 animate-pulse">🚚 Đang chia sẻ vị trí...</div>}
+                </div>
+            )}
         </div>
       </div>
 
@@ -537,6 +620,58 @@ function DashboardDriver() {
                               <tbody className="divide-y divide-gray-100">{dailyStats.map((stat, idx) => (<tr key={idx} className="hover:bg-gray-50 transition"><td className="px-3 py-3 font-medium text-gray-800">{stat.date}</td><td className="px-3 py-3 text-center font-bold text-blue-600">{stat.orders}</td><td className="px-3 py-3 text-right text-orange-600 font-medium">{stat.fuel.toFixed(1)} L</td><td className="px-3 py-3 text-right font-bold text-green-600">{stat.revenue.toLocaleString()} ₫</td></tr>))}</tbody>
                           </table>
                       )}
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* --- MODAL CẬP NHẬT THÔNG TIN CÁ NHÂN --- */}
+      {showProfileModal && (
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+              <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden p-6">
+                  <h2 className="text-xl font-bold text-blue-600 mb-4 flex items-center gap-2"><PersonIcon/> Thông tin tài xế</h2>
+                  <div className="space-y-4">
+                      <div>
+                          <label className="block text-gray-700 text-sm font-bold mb-2">Họ và tên</label>
+                          <input type="text" className="w-full p-3 border rounded-lg bg-gray-100 outline-none text-gray-600" value={profile.name || ''} readOnly />
+                      </div>
+                      <div>
+                          <label className="block text-gray-700 text-sm font-bold mb-2">Số điện thoại</label>
+                          <input 
+                              type="text" 
+                              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" 
+                              placeholder="VD: 0912345678" 
+                              value={phone} 
+                              onChange={(e) => setPhone(e.target.value)} 
+                          />
+                      </div>
+                      
+                      {/* --- THAY ĐỔI: Sử dụng thẻ <select> thay vì <input> --- */}
+                      <div>
+                          <label className="block text-gray-700 text-sm font-bold mb-2">Khu vực hoạt động</label>
+                          <select 
+                              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-white cursor-pointer"
+                              value={operatingArea}
+                              onChange={(e) => setOperatingArea(e.target.value)}
+                          >
+                              <option value="" disabled>-- Chọn khu vực --</option>
+                              <option value="Hà Nội">Hà Nội</option>
+                              <option value="Hồ Chí Minh">Hồ Chí Minh</option>
+                              <option value="Đà Nẵng">Đà Nẵng</option>
+                                <option value="Hải Phòng">Hải Phòng</option>
+                                <option value="Cần Thơ">Cần Thơ</option>
+                                <option value="Bình Dương">Bình Dương</option>
+                                <option value="Đồng Nai">Đồng Nai</option>
+                                <option value="Bắc Ninh">Bắc Ninh</option>
+                                <option value="Hải Dương">Hải Dương</option>
+                                <option value="Thanh Hóa">Thanh Hóa</option>
+                          </select>
+                          <p className="text-xs text-gray-500 mt-1">Cập nhật khu vực để nhận các đơn hàng phù hợp hơn.</p>
+                      </div>
+                  </div>
+                  <div className="flex justify-end gap-3 mt-6">
+                      <button onClick={() => setShowProfileModal(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg font-medium">Hủy</button>
+                      <button onClick={handleUpdateProfile} className="px-4 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition">Lưu thay đổi</button>
                   </div>
               </div>
           </div>

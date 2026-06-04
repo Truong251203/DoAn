@@ -13,6 +13,19 @@ const getDistanceFromLatLonInKm = (lat1, lon1, lat2, lon2) => {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
+// --- Helper: Tính quãng đường chuỗi lộ trình (Dùng cho VRP) ---
+const calcRouteDistanceDB = (startLoc, ordersArray) => {
+    let dist = 0;
+    let currLoc = startLoc;
+    for (const o of ordersArray) {
+        if (!o.pickupCoords || !o.deliveryCoords) continue;
+        dist += getDistanceFromLatLonInKm(currLoc.lat, currLoc.lng, o.pickupCoords.lat, o.pickupCoords.lng);
+        dist += getDistanceFromLatLonInKm(o.pickupCoords.lat, o.pickupCoords.lng, o.deliveryCoords.lat, o.deliveryCoords.lng);
+        currLoc = o.deliveryCoords;
+    }
+    return dist;
+};
+
 // --- Helper: Lấy vị trí an toàn của tài xế ---
 const getDriverEffectiveLocation = async (driver) => {
     if (driver.currentLocation && driver.currentLocation.lat) return driver.currentLocation;
@@ -68,7 +81,7 @@ const findLowestRevenueDriver = async () => {
 };
 
 // ============================================================
-// 3. GÁN HÀNG LOẠT (ĐỒNG BỘ LOGIC VỚI ALGO LAB)
+// 3. GÁN HÀNG LOẠT (TÍCH HỢP PROXIMITY, REVENUE & ULTIMATE VRP)
 // ============================================================
 const batchAssignOrders = async (strategy) => {
     // 1. Lấy danh sách Đơn hàng & Tài xế ĐANG HOẠT ĐỘNG
@@ -79,107 +92,204 @@ const batchAssignOrders = async (strategy) => {
 
     if (pendingOrders.length === 0 || drivers.length === 0) return { count: 0, orders: [] };
 
-    // 🔥 TÍNH TOÁN GIỚI HẠN TẢI TRỌNG (Max Capacity)
-    // Tính số đơn tối đa mỗi xe được ôm để tránh tình trạng 1 người ôm hết
     const maxCapacity = Math.ceil(pendingOrders.length / drivers.length) + 1;
-
-    // 2. Chuẩn bị dữ liệu xếp hàng
-    let driverQueue = [];
-    const activeOrders = await Order.find({ status: { $in: ['assigned', 'delivering'] } });
-
-    for (const d of drivers) {
-        const location = await getDriverEffectiveLocation(d);
-        const currentHoldingOrders = activeOrders.filter(o => o.driverId?.toString() === d._id.toString()).length;
-        
-        const info = { 
-            _id: d._id,
-            location: location,
-            currentRevenue: 0,
-            ordersCount: currentHoldingOrders // Thêm biến đếm số đơn đang ôm
-        };
-
-        // Tính doanh thu ngày hôm nay (Nếu chạy AI Cân Bằng)
-        if (strategy === 'revenue') {
-            const start = new Date(); start.setHours(0,0,0,0);
-            const end = new Date(); end.setHours(23,59,59,999);
-            const orders = await Order.find({ 
-                driverId: d._id, 
-                $or: [
-                    { status: { $in: ["assigned", "delivering", "in_progress"] } },
-                    { status: "completed", updatedAt: { $gte: start, $lte: end } }
-                ]
-            });
-            info.currentRevenue = orders.reduce((s, o) => s + (o.price || o.cost || 0), 0);
-        }
-        
-        driverQueue.push(info);
-    }
-
     const assignedResults = [];
-    
-    // 3. VÒNG LẶP CHIA ĐƠN THEO BẢN CHẤT ALGO LAB
-    // Sửa lại logic: Lặp qua TỪNG ĐƠN HÀNG, tìm tài xế tốt nhất cho đơn đó
-    let i = pendingOrders.length - 1;
-    
-    while (i >= 0) {
-        const order = pendingOrders[i];
-        
-        // Loại bỏ đơn thiếu tọa độ
-        if (!order.pickupCoords || !order.pickupCoords.lat) {
-            i--; continue;
+
+    // 🔥 TÍNH NĂNG MỚI: TỐI ƯU AI BẰNG THUẬT TOÁN VRP
+    if (strategy === 'vrp') {
+        let vrpDrivers = [];
+        for (const d of drivers) {
+            vrpDrivers.push({
+                _id: d._id,
+                initialLoc: await getDriverEffectiveLocation(d),
+                route: []
+            });
         }
 
-        let bestDriver = null;
-        let minDistance = Infinity;
-
-        // CHIẾN THUẬT 1: THAM LAM (AI GẦN NHẤT & CHƯA ĐẦY TẢI)
-        if (strategy === 'proximity') {
-            driverQueue.forEach(d => {
-                if (d.ordersCount < maxCapacity) {
-                    const dist = getDistanceFromLatLonInKm(order.pickupCoords.lat, order.pickupCoords.lng, d.location.lat, d.location.lng);
+        // BƯỚC 1: Khởi tạo bằng Tham Lam (Greedy)
+        pendingOrders.forEach(order => {
+            if (!order.pickupCoords || !order.pickupCoords.lat || !order.deliveryCoords) return;
+            
+            let bestDriver = null;
+            let minDistance = Infinity;
+            
+            vrpDrivers.forEach(d => {
+                if (d.route.length < maxCapacity) {
+                    const currentLoc = d.route.length > 0 ? d.route[d.route.length - 1].deliveryCoords : d.initialLoc;
+                    const dist = getDistanceFromLatLonInKm(order.pickupCoords.lat, order.pickupCoords.lng, currentLoc.lat, currentLoc.lng);
                     if (dist < minDistance) { minDistance = dist; bestDriver = d; }
                 }
             });
-        } 
-        
-        // CHIẾN THUẬT 2: ROUND-ROBIN (AI DOANH THU THẤP NHẤT HOẶC ĐANG ÔM ÍT ĐƠN NHẤT)
-        else if (strategy === 'revenue') {
-            driverQueue.sort((a, b) => {
-                if (a.ordersCount !== b.ordersCount) return a.ordersCount - b.ordersCount;
-                return a.currentRevenue - b.currentRevenue;
-            });
-            bestDriver = driverQueue[0];
-        }
-
-        // NẾU TÌM ĐƯỢC XE -> CHỐT GÁN
-        if (bestDriver) {
-            // Cập nhật Database
-            order.driverId = bestDriver._id;
-            order.status = "assigned";
-            order.history.push({ 
-                status: "assigned", 
-                reason: `AI Auto-Assign (${strategy === 'revenue' ? 'Balance Revenue' : 'Proximity'})`, 
-                timestamp: new Date() 
-            });
-            await order.save();
-
-            const populated = await Order.findById(order._id).populate("driverId", "name phone email").populate("customerId", "name phone email");
-            assignedResults.push(populated);
-
-            // Tăng gánh nặng cho tài xế để vòng lặp sau AI biết đường né
-            bestDriver.ordersCount += 1;
-            if (strategy === 'revenue') {
-                bestDriver.currentRevenue += (order.price || order.cost || 0);
-            }
             
-            // Dời vị trí tài xế đến điểm giao hàng của đơn này
-            if (order.deliveryCoords && order.deliveryCoords.lat) {
-                bestDriver.location = order.deliveryCoords;
+            if (!bestDriver) { // Fallback quét lại
+                vrpDrivers.forEach(d => {
+                    const currentLoc = d.route.length > 0 ? d.route[d.route.length - 1].deliveryCoords : d.initialLoc;
+                    const dist = getDistanceFromLatLonInKm(order.pickupCoords.lat, order.pickupCoords.lng, currentLoc.lat, currentLoc.lng);
+                    if (dist < minDistance) { minDistance = dist; bestDriver = d; }
+                });
             }
+            if (bestDriver) bestDriver.route.push(order);
+        });
+
+        // BƯỚC 2: Local Search Relocate (Ép cân bằng tải)
+        let iterations = 1000;
+        while (iterations > 0) {
+            let driverA = vrpDrivers[Math.floor(Math.random() * vrpDrivers.length)];
+            let driverB = vrpDrivers[Math.floor(Math.random() * vrpDrivers.length)];
+
+            if (driverA._id !== driverB._id && driverA.route.length > driverB.route.length + 1) {
+                let i = Math.floor(Math.random() * driverA.route.length);
+                let orderToMove = driverA.route[i];
+
+                let oldTotal = calcRouteDistanceDB(driverA.initialLoc, driverA.route) + calcRouteDistanceDB(driverB.initialLoc, driverB.route) + 0.001; // Tránh lỗi chia 0
+                
+                // Tạm thời xóa khỏi A
+                driverA.route.splice(i, 1);
+                
+                // Tìm vị trí chèn tốt nhất cho B
+                let bestInsertIndex = 0;
+                let bestNewDistB = Infinity;
+                for (let j = 0; j <= driverB.route.length; j++) {
+                    let tempRouteB = [...driverB.route];
+                    tempRouteB.splice(j, 0, orderToMove);
+                    let distB = calcRouteDistanceDB(driverB.initialLoc, tempRouteB);
+                    if (distB < bestNewDistB) { bestNewDistB = distB; bestInsertIndex = j; }
+                }
+
+                // Chấp nhận hy sinh tối đa 15% đường đi để lấy công bằng
+                if (calcRouteDistanceDB(driverA.initialLoc, driverA.route) + bestNewDistB <= oldTotal * 1.15) {
+                    driverB.route.splice(bestInsertIndex, 0, orderToMove);
+                } else {
+                    driverA.route.splice(i, 0, orderToMove); // Hoàn tác
+                }
+            }
+            iterations--;
         }
 
-        // Chuyển sang đơn tiếp theo
-        i--;
+        // BƯỚC 3: Tối ưu Nội bộ (TSP 2-opt) - Cắt giảm quãng đường đi vòng vèo
+        vrpDrivers.forEach(d => {
+            if (d.route.length < 2) return;
+            let improved = true;
+            while (improved) {
+                improved = false;
+                let currentDist = calcRouteDistanceDB(d.initialLoc, d.route);
+                for (let i = 0; i < d.route.length - 1; i++) {
+                    for (let j = i + 1; j < d.route.length; j++) {
+                        let newRoute = [
+                            ...d.route.slice(0, i),
+                            ...d.route.slice(i, j + 1).reverse(),
+                            ...d.route.slice(j + 1)
+                        ];
+                        let newDist = calcRouteDistanceDB(d.initialLoc, newRoute);
+                        if (newDist < currentDist) {
+                            d.route = newRoute;
+                            improved = true;
+                            break;
+                        }
+                    }
+                    if (improved) break;
+                }
+            }
+        });
+
+        // BƯỚC 4: Lưu kết quả VRP vào Database
+        for (const d of vrpDrivers) {
+            for (const order of d.route) {
+                order.driverId = d._id;
+                order.status = "assigned";
+                order.history.push({ 
+                    status: "assigned", 
+                    reason: "AI Auto-Assign (Ultimate VRP)", 
+                    timestamp: new Date() 
+                });
+                await order.save();
+                
+                const populated = await Order.findById(order._id).populate("driverId", "name phone email").populate("customerId", "name phone email");
+                assignedResults.push(populated);
+            }
+        }
+    } 
+    // 🔥 CHIẾN THUẬT CŨ: PROXIMITY VÀ REVENUE (Giữ nguyên logic gốc của bạn)
+    else {
+        let driverQueue = [];
+        const activeOrders = await Order.find({ status: { $in: ['assigned', 'delivering'] } });
+
+        for (const d of drivers) {
+            const location = await getDriverEffectiveLocation(d);
+            const currentHoldingOrders = activeOrders.filter(o => o.driverId?.toString() === d._id.toString()).length;
+            
+            const info = { 
+                _id: d._id,
+                location: location,
+                currentRevenue: 0,
+                ordersCount: currentHoldingOrders
+            };
+
+            if (strategy === 'revenue') {
+                const start = new Date(); start.setHours(0,0,0,0);
+                const end = new Date(); end.setHours(23,59,59,999);
+                const orders = await Order.find({ 
+                    driverId: d._id, 
+                    $or: [
+                        { status: { $in: ["assigned", "delivering", "in_progress"] } },
+                        { status: "completed", updatedAt: { $gte: start, $lte: end } }
+                    ]
+                });
+                info.currentRevenue = orders.reduce((s, o) => s + (o.price || o.cost || 0), 0);
+            }
+            driverQueue.push(info);
+        }
+
+        let i = pendingOrders.length - 1;
+        while (i >= 0) {
+            const order = pendingOrders[i];
+            if (!order.pickupCoords || !order.pickupCoords.lat) {
+                i--; continue;
+            }
+
+            let bestDriver = null;
+            let minDistance = Infinity;
+
+            if (strategy === 'proximity') {
+                driverQueue.forEach(d => {
+                    if (d.ordersCount < maxCapacity) {
+                        const dist = getDistanceFromLatLonInKm(order.pickupCoords.lat, order.pickupCoords.lng, d.location.lat, d.location.lng);
+                        if (dist < minDistance) { minDistance = dist; bestDriver = d; }
+                    }
+                });
+            } 
+            else if (strategy === 'revenue') {
+                driverQueue.sort((a, b) => {
+                    if (a.ordersCount !== b.ordersCount) return a.ordersCount - b.ordersCount;
+                    return a.currentRevenue - b.currentRevenue;
+                });
+                bestDriver = driverQueue[0];
+            }
+
+            if (bestDriver) {
+                order.driverId = bestDriver._id;
+                order.status = "assigned";
+                order.history.push({ 
+                    status: "assigned", 
+                    reason: `AI Auto-Assign (${strategy === 'revenue' ? 'Balance Revenue' : 'Proximity'})`, 
+                    timestamp: new Date() 
+                });
+                await order.save();
+
+                const populated = await Order.findById(order._id).populate("driverId", "name phone email").populate("customerId", "name phone email");
+                assignedResults.push(populated);
+
+                bestDriver.ordersCount += 1;
+                if (strategy === 'revenue') {
+                    bestDriver.currentRevenue += (order.price || order.cost || 0);
+                }
+                
+                if (order.deliveryCoords && order.deliveryCoords.lat) {
+                    bestDriver.location = order.deliveryCoords;
+                }
+            }
+            i--;
+        }
     }
 
     return { count: assignedResults.length, orders: assignedResults };

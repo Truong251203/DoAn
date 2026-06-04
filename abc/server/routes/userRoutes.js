@@ -61,8 +61,17 @@ router.put("/me", verifyToken, async (req, res) => {
 
     // ✅ Cập nhật thông tin cơ bản
     user.name = req.body.name ?? user.name;
-    user.phone = req.body.phone ?? user.phone;
+    user.phone = req.body.phone ?? user.phone; // Đã hỗ trợ cập nhật số điện thoại
     user.cccd = req.body.cccd ?? user.cccd;
+    
+    // 🔥 THÊM CẬP NHẬT KHU VỰC HOẠT ĐỘNG
+    if (req.body.operatingArea !== undefined) {
+      user.operatingArea = req.body.operatingArea;
+      
+      // Gán luôn giá trị này vào region_id để khớp với bộ lọc của Coordinator
+      user.region_id = req.body.operatingArea; 
+    }
+
     // ✅ Lưu địa chỉ lấy hàng mặc định
     if (req.body.address) user.address = req.body.address;
 
@@ -94,6 +103,18 @@ router.put("/me", verifyToken, async (req, res) => {
 
     await user.save();
     const updatedUser = await User.findById(req.user.id).select("-password");
+
+    // 🔥 BẮN SOCKET ĐỂ TRAN COORDINATOR TỰ ĐỘNG LÀM MỚI DANH SÁCH
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("driverProfileUpdated", {
+          driverId: updatedUser._id,
+          operatingArea: updatedUser.operatingArea,
+          region_id: updatedUser.region_id,
+          phone: updatedUser.phone
+      });
+    }
+
     res.json({ message: "Cập nhật thành công", user: updatedUser });
   } catch (err) {
     console.error(err);
@@ -208,14 +229,84 @@ router.put("/:id/unlock", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // ===============================
-// 🟢 Danh sách tài xế (Coordinator)
+// 🟢 Danh sách tài xế (Coordinator) - ĐÃ CẬP NHẬT ĐỂ TƯƠNG THÍCH MẢNG KHU VỰC
 // ===============================
 router.get("/drivers", verifyToken, verifyCoordinator, async (req, res) => {
   try {
-    const drivers = await User.find({ role: "driver", approved: true }).select("-password");
+    // Lấy thông tin coordinator đang đăng nhập
+    const coordinator = await User.findById(req.user.id);
+    if (!coordinator) return res.status(404).json({ message: "Không tìm thấy điều phối viên" });
+
+    // Tạo bộ lọc mặc định: là tài xế và đã duyệt
+    const filter = { role: "driver", approved: true };
+
+    // 🔥 SỬA CHỖ NÀY: Dùng mảng managedAreas thay vì region_id
+    if (coordinator.managedAreas && coordinator.managedAreas.length > 0) {
+      // Tìm các tài xế có region_id nằm trong danh sách các khu vực (managedAreas) mà coordinator này quản lý
+      filter.region_id = { $in: coordinator.managedAreas };
+    }
+
+    const drivers = await User.find(filter).select("-password");
     res.json(drivers);
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// ==========================================
+// TẠO TÀI KHOẢN ĐIỀU PHỐI VIÊN (CHỈ ADMIN) - ĐÃ SỬA NHẬN MẢNG managedAreas
+// ==========================================
+router.post("/create-coordinator", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { name, email, phone, password, managedAreas } = req.body;
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) return res.status(400).json({ message: "Email này đã được sử dụng!" });
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newCoordinator = new User({
+      name, email, phone,
+      password: hashedPassword,
+      role: "coordinator",
+      managedAreas: managedAreas || [], // Nhận danh sách khu vực từ Frontend
+      approved: true,
+      status: "active"
+    });
+
+    await newCoordinator.save();
+    
+    // Xóa password trước khi gửi về response
+    const { password: pass, ...userKhongPass } = newCoordinator._doc;
+    res.status(201).json({ message: "Tạo thành công", user: userKhongPass });
+
+  } catch (err) {
+    res.status(500).json({ message: "Lỗi server khi tạo tài khoản" });
+  }
+});
+
+// ==========================================
+// API: ADMIN GÁN HOẶC ĐỔI KHU VỰC CHO ĐIỀU PHỐI VIÊN - ĐÃ ĐỔI TÊN ĐƯỜNG DẪN & BIẾN SỐ
+// ==========================================
+router.put("/:id/areas", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { managedAreas } = req.body;
+    
+    // Tìm user và đảm bảo họ là coordinator
+    const user = await User.findOne({ _id: req.params.id, role: "coordinator" });
+    if (!user) {
+      return res.status(404).json({ message: "Không tìm thấy điều phối viên hợp lệ" });
+    }
+
+    // Cập nhật mảng khu vực
+    user.managedAreas = managedAreas;
+    await user.save();
+
+    const updatedUser = await User.findById(user._id).select("-password");
+    res.json({ message: "Đã cập nhật khu vực quản lý thành công!", user: updatedUser });
+  } catch (err) {
+    res.status(500).json({ message: "Lỗi server khi phân khu vực" });
   }
 });
 

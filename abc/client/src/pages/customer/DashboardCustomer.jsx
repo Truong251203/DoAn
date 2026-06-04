@@ -144,16 +144,29 @@ function DashboardCustomer() {
   // Data (Bổ sung cccd)
   const [profile, setProfile] = useState({ name: "", email: "", phone: "", cccd: "", address: "", pickupCoords: { lat: 21.0285, lng: 105.8542 }, pickupLocations: [] });
   
-  // Data tạo đơn (Bổ sung recipientPhone)
+  // Data tạo đơn
   const [newOrder, setNewOrder] = useState({ pickupAddress: "", pickupCoords: null, deliveryAddress: "", deliveryCoords: null, description: "", weight: "", pickupIndex: null, pickupTime: "", recipientPhone: "" });
   const [estimation, setEstimation] = useState({ distance: 0, price: 0 });
   const [activeTab, setActiveTab] = useState("createOrder");
+
+  // ĐÃ BỔ SUNG: State lưu giá cước từ Server
+  const [pricing, setPricing] = useState({ pricePerKm: 10000, pricePerKg: 2000 });
 
   // --- INITIAL DATA ---
   useEffect(() => {
     fetchOrders();
     fetchProfile();
+    fetchPricing(); // Bổ sung gọi API lấy giá cước
   }, []);
+
+  const fetchPricing = async () => {
+    try {
+      const res = await api.get("/settings/pricing");
+      if (res.data) setPricing(res.data);
+    } catch (error) {
+      console.warn("Lỗi tải giá cước, dùng mặc định 10k/km");
+    }
+  };
 
   // --- SOCKET LISTENERS ---
   useEffect(() => {
@@ -168,13 +181,10 @@ function DashboardCustomer() {
     };
 
     const handleOrderUpdated = (updatedOrder) => {
-        // 🔥 ĐÃ CẬP NHẬT: Thêm logic thông báo cho khách hàng
         setOrders((prev) => {
-            // Kiểm tra xem đơn vừa cập nhật có nằm trong danh sách đơn của ông khách này không
             const isMyOrder = prev.some(o => o._id === updatedOrder._id);
 
             if (isMyOrder) {
-                // Dùng setTimeout để không block luồng render của React
                 setTimeout(() => {
                     if (updatedOrder.status === 'confirmed') {
                         alert(`✅ TIN VUI: Đơn hàng #${updatedOrder._id.slice(-6).toUpperCase()} của bạn đã được hệ thống XÁC NHẬN!`);
@@ -213,7 +223,8 @@ function DashboardCustomer() {
     } else {
         setEstimation({ distance: 0, price: 0 }); setRouteCoords([]); 
     }
-  }, [newOrder.pickupCoords, newOrder.deliveryCoords, newOrder.weight]);
+    // Thêm pricing vào mảng dependency để tính lại nếu giá server trả về chậm
+  }, [newOrder.pickupCoords, newOrder.deliveryCoords, newOrder.weight, pricing]);
 
   const fetchRouteAndPrice = async () => {
       try {
@@ -227,7 +238,10 @@ function DashboardCustomer() {
           const summary = res.data?.features?.[0]?.properties?.summary || {};
           const distKm = (summary.distance || 0) / 1000;
           const weightVal = parseFloat(newOrder.weight) || 0;
-          const price = (distKm * 10000) + (weightVal * 2000);
+          
+          // ĐÃ SỬA: Tính toán dựa vào giá trị lấy từ Admin
+          const price = (distKm * pricing.pricePerKm) + (weightVal * pricing.pricePerKg);
+          
           setEstimation({ distance: distKm, price: Math.round(price) });
       } catch (error) { setRouteCoords([]); }
   };
@@ -277,11 +291,8 @@ function DashboardCustomer() {
     } catch { alert("Lỗi tạo đơn"); }
   };
 
-  // --- LOGIC HUỶ ĐƠN CÓ TÍNH PHÍ MỚI ---
   const cancelOrder = async (order) => { 
     let cancelFee = 0;
-    
-    // Tính phí huỷ nếu đơn đã được xác nhận bởi coordinator hoặc đã giao cho tài xế
     if (order.status === "assigned" || order.status === "confirmed") {
         cancelFee = 15000;
     }
@@ -293,7 +304,6 @@ function DashboardCustomer() {
     if(!window.confirm(confirmMessage)) return; 
 
     try { 
-        // Gửi request huỷ kèm thông tin phí huỷ
         await api.put(`/orders/${order._id}/request-cancel`, { cancelFee }); 
         alert("Đã gửi yêu cầu huỷ đơn thành công"); 
         fetchOrders(); 
@@ -525,6 +535,12 @@ function DashboardCustomer() {
                                     <p className="font-bold text-red-700 text-sm mt-1">{new Date(selectedOrder.pickupTime).toLocaleString("vi-VN")}</p>
                                 </div>
                             )}
+                            {selectedOrder.status === 'cancelled' && (
+        <div className="mt-2 bg-red-50 p-3 border border-red-200 rounded-lg">
+            <p className="text-xs text-red-600 uppercase font-black">❌ Đơn hàng đã bị hủy</p>
+            <p className="font-medium text-red-800 text-sm mt-1">Lý do: {selectedOrder.cancelReason || selectedOrder.failedReason || "Hệ thống từ chối"}</p>
+        </div>
+    )}
                         </div>
 
                         <div className="bg-gray-50 p-3 rounded-xl border border-gray-200">

@@ -5,9 +5,10 @@ const Order = require("../models/Order");
 const User = require("../models/User"); // Đảm bảo import User
 const { verifyToken, verifyCustomer, verifyCoordinator, verifyDriver } = require("../middleware/verify");
 const { batchAssignOrders } = require("../services/autoAssignService");
+const Setting = require("../models/Setting");
 
 // ==========================================
-// 1. TẠO ĐƠN HÀNG (ĐÃ SỬA: KHỚP GIÁ VỚI FRONTEND)
+// 1. TẠO ĐƠN HÀNG (ĐÃ SỬA: LƯU THÊM REGION_ID)
 // ==========================================
 router.post("/", verifyToken, verifyCustomer, async (req, res) => {
   try {
@@ -19,7 +20,7 @@ router.post("/", verifyToken, verifyCustomer, async (req, res) => {
       });
     }
 
-    // Lấy dữ liệu từ Frontend gửi lên (bao gồm cả giá và lộ trình đã tính)
+    // Lấy dữ liệu từ Frontend gửi lên
     const { 
         pickupCoords, 
         deliveryCoords, 
@@ -27,9 +28,12 @@ router.post("/", verifyToken, verifyCustomer, async (req, res) => {
         distance: clientDistance, 
         price: clientPrice, 
         route: clientRoute,
-        description ,
+        description,
         pickupTime,       
-        recipientPhone
+        recipientPhone,
+        pickupAddress,    // <-- Địa chỉ dạng text
+        deliveryAddress,
+        region_id         // 🔥 LẤY MÃ KHU VỰC TỪ FRONTEND
     } = req.body;
 
     if (!weight || weight <= 0) {
@@ -39,7 +43,7 @@ router.post("/", verifyToken, verifyCustomer, async (req, res) => {
     let route = clientRoute || [];
     let distance = clientDistance || 0;
 
-    // Chỉ tự tính lại nếu Frontend KHÔNG gửi lên (Fallback an toàn)
+    // Chỉ tự tính lại nếu Frontend KHÔNG gửi lên
     if (!distance || !route || route.length === 0) {
         console.log("⚠️ Frontend thiếu dữ liệu lộ trình, Server tự tính toán lại...");
         try {
@@ -55,35 +59,58 @@ router.post("/", verifyToken, verifyCustomer, async (req, res) => {
         }
     }
 
-    // ƯU TIÊN LẤY GIÁ TỪ FRONTEND ĐỂ ĐỒNG BỘ
+    // Tính giá
     let finalCost = 0;
     if (clientPrice) {
         finalCost = clientPrice;
     } else {
-        // Công thức tính nếu không có giá: 10k/km + 2k/kg
-        finalCost = distance * 10000 + weight * 2000;
+        let pricePerKm = 10000; 
+        let pricePerKg = 2000;
+        try {
+            const pricingSetting = await Setting.findOne({ key: "pricing" });
+            if (pricingSetting && pricingSetting.value) {
+                pricePerKm = pricingSetting.value.pricePerKm || 10000;
+                pricePerKg = pricingSetting.value.pricePerKg || 2000;
+            }
+        } catch (e) {
+            console.warn("Lỗi lấy giá cước, dùng giá mặc định");
+        }
+        finalCost = (distance * pricePerKm) + (weight * pricePerKg);
+    }
+
+    // 🔥 LOGIC LƯU REGION_ID: 
+    // Nếu FE truyền sẵn thì dùng luôn. Nếu ko có, thử đoán dựa trên pickupAddress
+    let finalRegionId = region_id;
+    if (!finalRegionId && pickupAddress) {
+        const addrLower = pickupAddress.toLowerCase();
+        // Bạn có thể mở rộng danh sách này tùy theo các khu vực bạn đang kinh doanh
+        if (addrLower.includes("hà nội")) finalRegionId = "Hà Nội";
+        else if (addrLower.includes("hồ chí minh") || addrLower.includes("tphcm")) finalRegionId = "Hồ Chí Minh";
+        else if (addrLower.includes("đà nẵng")) finalRegionId = "Đà Nẵng";
+        else if (addrLower.includes("hải phòng")) finalRegionId = "Hải Phòng";
+        else if (addrLower.includes("cần thơ")) finalRegionId = "Cần Thơ";
     }
 
     const newOrder = new Order({
       customerId: req.user.id,
       pickupCoords,
       deliveryCoords,
-      pickupAddress: req.body.pickupAddress,   // Lưu địa chỉ dạng text
-      deliveryAddress: req.body.deliveryAddress, // Lưu địa chỉ dạng text
+      pickupAddress,  
+      deliveryAddress,
       weight,
       description,
-      route,      // Lộ trình (để vẽ map)
-      distance,   // Khoảng cách
-      cost: finalCost, // Giá gốc (backend dùng)
-      price: finalCost, // Giá hiển thị (khớp frontend)
+      route,      
+      distance,   
+      cost: finalCost, 
+      price: finalCost, 
       status: "pending",
-      pickupTime,        // <--- LƯU VÀO DB
-      recipientPhone
+      pickupTime,        
+      recipientPhone,
+      region_id: finalRegionId // 🔥 LƯU VÀO DB ĐỂ ĐIỀU PHỐI VIÊN CÓ THỂ THẤY!
     });
 
     await newOrder.save();
 
-    // Phát socket thông báo có đơn mới
     try {
         const io = req.app.get("io");
         if(io) io.emit("orderCreated", newOrder);
@@ -174,7 +201,7 @@ router.get("/stats/driver", verifyToken, verifyDriver, async (req, res) => {
     const totalOrders = filtered.length;
     const totalKm = filtered.reduce((s, o) => s + (o.distance || 0), 0);
     const fuelUsed = filtered.reduce((s, o) => s + (o.fuelUsed || 0), 0);
-    const revenue = filtered.reduce((s, o) => s + (o.price || o.cost || 0), 0); // Lấy price hoặc cost
+    const revenue = filtered.reduce((s, o) => s + (o.price || o.cost || 0), 0); 
 
     res.json({ startDate, endDate, totalOrders, totalKm, fuelUsed, revenue });
   } catch (err) {
@@ -247,7 +274,7 @@ router.put("/assign/:id", verifyToken, verifyCoordinator, async (req, res) => {
     const { driverId } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: "Không tìm thấy đơn" });
-    // CHẶN ĐỔI TÀI XẾ NẾU ĐƠN ĐÃ GIAO / HOÀN THÀNH / HỦY
+    
     const lockedStatuses = ["delivering", "completed", "cancelled"];
     if (lockedStatuses.includes(order.status)) {
         return res.status(400).json({ 
@@ -256,13 +283,11 @@ router.put("/assign/:id", verifyToken, verifyCoordinator, async (req, res) => {
     }
 
     if (!driverId) {
-      // TRƯỜNG HỢP HỦY GÁN: Xóa tài xế và đưa về confirmed
       order.driverId = null;
       order.status = "confirmed";
       order.history = order.history || [];
       order.history.push({ status: "confirmed", reason: "Coordinator unassigned driver", timestamp: new Date() });
     } else {
-      // TRƯỜNG HỢP GÁN TÀI XẾ
       order.driverId = driverId;
       order.status = "assigned";
       order.history = order.history || [];
@@ -282,18 +307,22 @@ router.put("/assign/:id", verifyToken, verifyCoordinator, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
 // ==========================================
 // API MỚI: ĐIỀU PHỐI VIÊN XÁC NHẬN / TỪ CHỐI ĐƠN
 // ==========================================
 router.put("/:id/coordinator-status", verifyToken, verifyCoordinator, async (req, res) => {
   try {
-    const { status } = req.body; // Nhận 'confirmed' hoặc 'cancelled' từ Frontend
+    const { status, cancelReason } = req.body; 
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: "Không tìm thấy đơn" });
 
     order.status = status;
+    if (status === 'cancelled' && cancelReason) {
+        order.cancelReason = cancelReason;
+    }
     order.history = order.history || [];
-    order.history.push({ status: status, reason: `Coordinator updated status`, timestamp: new Date() });
+    order.history.push({ status: status, reason: cancelReason || `Coordinator updated status`, timestamp: new Date() });
 
     await order.save();
     const updatedOrder = await Order.findById(order._id).populate("driverId").populate("customerId");
@@ -348,9 +377,8 @@ router.put("/:id/status", verifyToken, verifyDriver, async (req, res) => {
       order.completedAt = new Date();
       order.distance = distance || order.distance;
       order.fuelUsed = fuelUsed || order.fuelUsed;
-      order.revenue = revenue || order.price || order.cost; // Ưu tiên revenue gửi lên, không thì lấy giá gốc
+      order.revenue = revenue || order.price || order.cost; 
       
-      // Cập nhật lại lộ trình thực tế nếu có
       if (Array.isArray(route) && route.length > 0) {
         order.route = route;
       }
@@ -398,18 +426,15 @@ router.put("/:id/cancel/approve", verifyToken, verifyCoordinator, async (req, re
     res.status(500).json({ message: "Lỗi server" });
   }
 });
+
 // ---------------------------------------------------------
 // 🔥 API MỚI: GÁN ĐƠN HÀNG LOẠT (BATCH ASSIGN)
 // ---------------------------------------------------------
 router.post("/auto-assign-batch", verifyToken, verifyCoordinator, async (req, res) => {
   try {
-    const { strategy } = req.body; // 'proximity' hoặc 'revenue'
-    
-    // Gọi service xử lý logic gán nhiều đơn cùng lúc
+    const { strategy } = req.body; 
     const result = await batchAssignOrders(strategy);
 
-    // Phát socket cập nhật Frontend cho từng đơn thành công
-    // Để danh sách đơn hàng trên giao diện tự động nhảy sang trạng thái "Assigned"
     const io = req.app.get("io");
     if (io && result.orders.length > 0) {
         result.orders.forEach(order => {
@@ -428,6 +453,7 @@ router.post("/auto-assign-batch", verifyToken, verifyCoordinator, async (req, re
     res.status(500).json({ message: err.message });
   }
 });
+
 // ==========================================
 // API: ĐIỀU PHỐI VIÊN GÁN ĐƠN THỦ CÔNG 
 // ==========================================
@@ -452,12 +478,10 @@ router.put("/:id/assign", verifyToken, verifyCoordinator, async (req, res) => {
 
         await order.save();
 
-        // Populate để gửi qua Socket
         const populatedOrder = await Order.findById(order._id)
             .populate("driverId", "name phone email")
             .populate("customerId", "name phone email");
 
-        // Bắn socket báo cho tài xế biết
         const io = req.app.get("io");
         if (io) io.emit("orderUpdated", populatedOrder);
 
@@ -466,7 +490,7 @@ router.put("/:id/assign", verifyToken, verifyCoordinator, async (req, res) => {
         res.status(500).json({ message: "Lỗi server" });
     }
 });
-// ---------------------------------------------------------
+
 // ==========================================
 // THÊM MỚI: XÓA NHIỀU ĐƠN HÀNG ĐÃ CHỌN
 // ==========================================
@@ -478,10 +502,8 @@ router.post("/batch-delete", verifyToken, verifyCoordinator, async (req, res) =>
       return res.status(400).json({ message: "Vui lòng chọn ít nhất 1 đơn hàng để xóa." });
     }
 
-    // Xóa tất cả các đơn hàng có ID nằm trong mảng orderIds
     const result = await Order.deleteMany({ _id: { $in: orderIds } });
 
-    // Phát socket để các màn hình khác tự cập nhật (nếu cần)
     try {
         const io = req.app.get("io");
         if (io) io.emit("ordersDeleted", orderIds);

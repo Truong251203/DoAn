@@ -12,11 +12,29 @@ const UserSchema = new mongoose.Schema({
   },
   phone: { type: String, default: "" },
   cccd: { type: String, default: "" },
+
+  // ===============================
+  // 🟢 ĐỊA CHỈ & KHU VỰC
+  // ===============================
+  address: { type: String, default: "" }, 
   
+  // Vẫn giữ region_id nếu bạn cần dùng cho Tài xế (Driver - 1 người 1 khu vực)
+  region_id: { 
+    type: String, 
+    default: null 
+  },
+
+  // 🔥 THÊM MỚI TRƯỜNG NÀY ĐỂ LƯU NHIỀU KHU VỰC CHO COORDINATOR
+  managedAreas: {
+    type: [String], // Khai báo dạng mảng (Array) để lưu nhiều khu vực
+    default: []
+  },
+  // ===============================
+
   // Quyền phê duyệt
   approved: { type: Boolean, default: false },
 
-  // 🔥 ĐÃ BỔ SUNG TRƯỜNG STATUS ĐỂ LƯU TRẠNG THÁI KHÓA/MỞ
+  // Trạng thái tài khoản
   status: { type: String, enum: ['active', 'locked'], default: 'active' },
 
   // Kháng cáo
@@ -50,6 +68,6 @@ const UserSchema = new mongoose.Schema({
   totalFuel: { type: Number, default: 0 },
   totalProfit: { type: Number, default: 0 },
 
-}, { timestamps: true }); // Mình khuyên bạn nên thêm timestamps để dễ quản lý
+}, { timestamps: true }); 
 
 module.exports = mongoose.model("User", UserSchema);
